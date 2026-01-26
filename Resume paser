@@ -1,0 +1,537 @@
+import PyPDF2
+import ollama
+import json
+import re
+import logging
+from datetime import datetime
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LOGGING SETUP
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1. READ PDF
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def read_pdf(path):
+    """Extract text from PDF"""
+    try:
+        text = ""
+        with open(path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                if page.extract_text():
+                    text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        logger.error(f"Failed to read {path}: {e}")
+        return ""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 2. EXTRACT NAME
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION_KEYWORDS = {
+    "career", "goal", "skills", "summary", "experience",
+    "objective", "profile", "education", "projects",
+    "declaration", "personal", "technical"
+}
+
+def extract_name(resume_text):
+    """Extract candidate name from resume (YOUR ORIGINAL)"""
+    lines = [l.strip() for l in resume_text.split("\n") if l.strip()]
+    for line in lines[:10]:
+        clean = re.sub(r'[^a-zA-Z\s]', '', line).strip()
+        words = clean.lower().split()
+        if (line.endswith(":") or any(w in SECTION_KEYWORDS for w in words) or 
+            len(words) > 4 or len(words) < 2):
+            continue
+        if re.search(r'(engineer|developer|manager|lead|designer)', clean, re.I):
+            continue
+        if line.isupper():
+            continue
+        return clean.title()
+    for line in lines:
+        if "@" in line:
+            username = line.split("@")[0]
+            username = re.sub(r'[^a-zA-Z]', ' ', username)
+            return " ".join(username.split()).title()
+    return "Unknown"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 3. EXTRACT EXPLICIT EXPERIENCE (YOUR ORIGINAL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def extract_explicit_experience(resume_text, file_name=""):
+    """Extract experience from explicit mentions like '8+ years' (YOUR ORIGINAL)"""
+    text = (resume_text + " " + file_name).lower()
+    
+    # Digit patterns
+    digit_patterns = [
+        r'\b(1[0-5]|[1-9])\s*\+\s*(?:years?|yrs?)\b',
+        r'\b(1[0-5]|[1-9])\s*(?:years?|yrs?)\s*(?:of\s+)?experience\b',
+        r'\bexperience\s*[:\-]?\s*(1[0-5]|[1-9])\s*(?:years?|yrs?)\b',
+        r'\b(?:over|more\s+than|approximately|around|nearly)\s+(1[0-5]|[1-9])\s*(?:years?|yrs?)\b',
+        r'\b(1[0-5]|[1-9])\s*(?:years?|yrs?)\s*(?:of\s+)?(?:tenure|service|background)\b',
+        r'\b(1[0-5]|[1-9])\s*(?:years?|yrs?)\s*(?:in\s+the\s+)?(?:field|industry|role|workforce)\b',
+    ]
+    for pattern in digit_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return float(match.group(1))
+    
+    # Word patterns
+    word_to_digit = {
+        'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+        'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+        'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15
+    }
+    word_list = '|'.join(word_to_digit.keys())
+    word_patterns = [
+        rf'\b({word_list})\s*(?:years?|yrs?)\s*(?:of\s+)?(?:experience|tenure|service|background|expertise)\b',
+        rf'\b({word_list})\s*(?:years?|yrs?)\s*(?:in\s+the\s+)?(?:field|industry|role|workforce|position)\b',
+        rf'\bin\s*({word_list})\s*(?:years?|yrs?)\s*of\s*(?:experience|service)',
+    ]
+    for pattern in word_patterns:
+        match = re.search(pattern, text)
+        if match:
+            word = match.group(1).lower()
+            if word in word_to_digit:
+                return float(word_to_digit[word])
+    return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 4. EDUCATION FILTERING (YOUR ORIGINAL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EDUCATION_KEYWORDS = {
+    "student", "course", "degree", "certificate", "diploma",
+    "bootcamp", "training program", "school", "college",
+    "university", "intern", "fellowship", "residency"
+}
+
+def is_education_entry(role):
+    """Check if role is education-related (YOUR ORIGINAL)"""
+    role_lower = role.lower()
+    for keyword in EDUCATION_KEYWORDS:
+        if keyword in role_lower:
+            return True
+    if re.search(r'(student|intern|trainee|fellow|resident)$', role_lower):
+        return True
+    if re.search(r'(course|program|certificate|bootcamp)\s+in\b', role_lower):
+        return True
+    return False
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 5. NORMALIZE END DATES (YOUR ORIGINAL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def normalize_end_date(end_date):
+    """Normalize end date to 'Present' if ongoing (YOUR ORIGINAL)"""
+    if not end_date:
+        return "Present"
+    text = end_date.strip().lower()
+    ongoing_words = [
+        "present", "till now", "till date", "to date", "currently",
+        "current", "ongoing", "working", "still", "now", "till today"
+    ]
+    for word in ongoing_words:
+        if word in text:
+            return "Present"
+    return end_date
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 6. CALCULATE EXPERIENCE (YOUR ORIGINAL LOGIC)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def calculate_experience_correct(experiences):
+    """Calculate total experience handling overlaps (YOUR ORIGINAL)"""
+    ranges = []
+    for exp in experiences:
+        try:
+            start = datetime.strptime(exp["start_date"], "%Y-%m")
+            end_raw = normalize_end_date(exp["end_date"])
+            if end_raw == "Present":
+                end = datetime.now()
+            else:
+                end = datetime.strptime(end_raw, "%Y-%m")
+            
+            start_month_idx = start.year * 12 + start.month
+            end_month_idx = end.year * 12 + end.month
+            
+            if end_month_idx > start_month_idx:
+                ranges.append((start_month_idx, end_month_idx, exp['role']))
+        except ValueError:
+            continue
+
+    if not ranges:
+        return 0.0, []
+
+    # Merge overlapping ranges
+    ranges.sort()
+    merged = []
+    for s, e, role in ranges:
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e, role])
+        else:
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+
+    total_months = sum(e - s for s, e, _ in merged)
+    total_years = round(total_months / 12, 1)
+    
+    breakdown = []
+    for s, e, role in merged:
+        months = e - s
+        years = round(months / 12, 2)
+        breakdown.append({
+            "role": role,
+            "start": datetime(s // 12, s % 12 + 1, 1).strftime("%Y-%m"),
+            "end": datetime(e // 12, e % 12 + 1, 1).strftime("%Y-%m"),
+            "duration_years": years
+        })
+
+    return total_years, breakdown
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 7. UNIFIED LLM EXTRACTION (YOUR OPTIMIZED VERSION)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def extract_all_data_unified(resume_text):
+    """Extract all data in one LLM call (YOUR OPTIMIZED VERSION)"""
+    prompt = """Extract ALL resume data and return ONLY valid JSON (NO markdown, NO explanations).
+
+CRITICAL RULES:
+1. QUALIFICATIONS: Extract degree name, institution, graduation year, field. Sort by level (PhD > Masters > Bachelor > Diploma).
+2. TECHNICAL SKILLS: Only programming languages, frameworks, tools, databases, platforms. EXCLUDE soft skills.
+3. WORK EXPERIENCE: MUST include ALL jobs. Convert dates to "YYYY-MM" format. If "Till date" or "Current", use "Present"
+
+Return EXACTLY this JSON structure:
+{
+  "qualifications": [{"qualification_name": "", "college_name": "", "graduation_year": "", "field_of_study": ""}],
+  "technical_skills": {"programming_languages": [], "frameworks_libraries": [], "tools": [], "platforms": [], "databases": [], "other": []},
+  "work_experience": [{"role": "", "start_date": "YYYY-MM", "end_date": "YYYY-MM or Present"}]
+}
+
+Resume:
+""" + resume_text
+
+    try:
+        response = ollama.chat(
+            model="llama3",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response["message"]["content"].strip()
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        
+        if start == -1 or end == -1:
+            return None
+        
+        json_text = raw[start:end]
+        data = json.loads(json_text)
+        
+        # Filter soft skills (YOUR LOGIC)
+        if "technical_skills" in data:
+            soft_skills = {
+                "self-motivated", "organized", "energetic", "upbeat", 
+                "communicator", "motivated", "effective", "communication", 
+                "leadership", "teamwork", "problem-solving", "analytical", 
+                "critical thinking"
+            }
+            for category in data["technical_skills"]:
+                if isinstance(data["technical_skills"][category], list):
+                    data["technical_skills"][category] = [
+                        skill for skill in data["technical_skills"][category]
+                        if skill.lower() not in soft_skills and len(skill.strip()) > 0
+                    ]
+        
+        return data
+    except Exception as e:
+        logger.error(f"LLM extraction failed: {e}")
+        return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 7B. GENERATE CREDIBILITY QUESTIONS (SEPARATE FOCUSED CALL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def generate_credibility_questions(resume_text, name, qualifications, skills, work_exp_years):
+    """Generate 5 technical specification questions based on resume content"""
+    
+    # Build context summary
+    highest_qual = qualifications[0] if qualifications else {}
+    qual_str = f"{highest_qual.get('qualification_name', 'N/A')} from {highest_qual.get('college_name', 'N/A')}"
+    
+    skill_summary = []
+    for category, items in skills.items():
+        if items:
+            skill_summary.extend(items[:3])  # Top 3 from each category
+    skills_str = ", ".join(skill_summary[:8])
+    
+    prompt = f"""Based on this resume, generate EXACTLY 5 technical specification/validation questions.
+
+CRITICAL RULES:
+1. Questions MUST ask about TECHNICAL SPECS, VALUES, PARAMETERS from things mentioned in resume
+2. Ask about: operating voltages, interface speeds, frequencies, protocols specs, tool versions, standards used
+3. Questions should be FACTUAL and TESTABLE - not about "challenges" or "experience"
+4. Reference SPECIFIC technologies/components/projects mentioned in the resume
+5. Return ONLY a JSON array of 5 strings
+
+GOOD EXAMPLES (Technical Specs):
+- "What operating voltage range does the SHARC ADSP-SC587 processor use?"
+- "What interface speed did you configure for DDR3 memory in your RF Data Modem design?"
+- "What's the typical baud rate you used for CAN bus communication in your automotive projects?"
+- "Which version of OrCAD did you primarily use for schematic design?"
+- "What sampling frequency did you implement for the ECG detection in your smartwatch project?"
+- "What's the maximum current rating for the High-side driver circuits you designed?"
+- "Which EMI/EMC standard did you follow - MIL-STD 461 or IEC 61000?"
+
+BAD EXAMPLES (Too generic/subjective):
+- "What challenges did you face?" ❌
+- "Tell me about your experience with CAN protocol?" ❌
+- "Why did you choose this design?" ❌
+- "What are your strengths?" ❌
+
+CANDIDATE INFO:
+Name: {name}
+Experience: {work_exp_years} years
+Qualifications: {qual_str}
+Key Skills: {skills_str}
+
+RESUME EXCERPT (Use specific technical details from here):
+{resume_text[:3500]}
+
+Return format (EXACTLY):
+["Question 1?", "Question 2?", "Question 3?", "Question 4?", "Question 5?"]
+"""
+
+    try:
+        response = ollama.chat(
+            model="llama3",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response["message"]["content"].strip()
+        
+        # Extract JSON array
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        
+        if start == -1 or end == -1:
+            logger.warning("No JSON array found in credibility questions response")
+            return []
+        
+        json_text = raw[start:end]
+        questions = json.loads(json_text)
+        
+        # Ensure exactly 5 questions
+        if len(questions) > 5:
+            questions = questions[:5]
+        elif len(questions) < 5:
+            logger.warning(f"Only {len(questions)} credibility questions generated")
+        
+        return questions
+        
+    except Exception as e:
+        logger.error(f"Credibility questions generation failed: {e}")
+        return []
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 8. PROCESS SINGLE RESUME (YOUR COMPLETE LOGIC)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def process_resume(resume_path):
+    """Process a single resume (YOUR COMPLETE LOGIC)"""
+    filename = Path(resume_path).name
+    logger.info(f"Processing: {filename}")
+    
+    try:
+        resume_text = read_pdf(resume_path)
+        if not resume_text:
+            return {"status": "error", "error": "Failed to read PDF", "file": str(resume_path)}
+        
+        name = extract_name(resume_text)
+        llm_data = extract_all_data_unified(resume_text)
+        
+        if not llm_data:
+            return {"status": "error", "error": "Failed to extract data", "file": str(resume_path)}
+        
+        # YOUR TWO-STEP EXPERIENCE LOGIC
+        explicit_exp = extract_explicit_experience(resume_text, filename)
+        if explicit_exp is not None:
+            total_years_exp = explicit_exp
+            experience_source = "explicit_mention"
+            breakdown_exp = []
+            logger.info(f"  → Experience from explicit mention: {explicit_exp} years")
+        else:
+            work_exp = llm_data.get("work_experience", [])
+            logger.info(f"  → Extracted {len(work_exp)} work experiences from LLM")
+            
+            if work_exp:
+                filtered = []
+                for exp in work_exp:
+                    role = exp.get("role", "")
+                    if not is_education_entry(role):
+                        # Normalize dates
+                        if len(exp.get("start_date", "")) == 4:
+                            exp["start_date"] = exp["start_date"] + "-01"
+                        if exp.get("end_date", "").lower() != "present" and len(exp.get("end_date", "")) == 4:
+                            exp["end_date"] = exp["end_date"] + "-01"
+                        filtered.append(exp)
+                        logger.info(f"    ✓ {role}: {exp.get('start_date')} → {exp.get('end_date')}")
+                    else:
+                        logger.info(f"    ✗ Filtered (education): {role}")
+                
+                if filtered:
+                    total_years_exp, breakdown_exp = calculate_experience_correct(filtered)
+                    experience_source = "calculated_from_work_dates"
+                    logger.info(f"  → Calculated total: {total_years_exp} years from {len(filtered)} jobs")
+                else:
+                    total_years_exp = 0.0
+                    breakdown_exp = []
+                    experience_source = "none"
+                    logger.warning(f"  → No valid work experience after filtering")
+            else:
+                total_years_exp = 0.0
+                breakdown_exp = []
+                experience_source = "none"
+                logger.warning(f"  → LLM returned no work experience")
+        
+        qualifications = llm_data.get("qualifications", [])
+        highest_qualification = qualifications[0] if len(qualifications) > 0 else None
+        skills = llm_data.get("technical_skills", {})
+        
+        # Generate credibility questions AFTER we have all the data
+        credibility_questions = generate_credibility_questions(
+            resume_text, name, qualifications, skills, total_years_exp
+        )
+        
+        logger.info(f"✅ {filename}: {name} | {total_years_exp} years | {sum(len(v) for v in skills.values())} skills")
+        
+        return {
+            "status": "success",
+            "filename": filename,
+            "name": name,
+            "work_experience": {
+                "total_years": total_years_exp,
+                "source": experience_source,
+                "breakdown": breakdown_exp
+            },
+            "qualifications": {
+                "highest_qualification": highest_qualification,
+                "all_qualifications": qualifications
+            },
+            "technical_skills": skills,
+            "credibility_questions": credibility_questions
+        }
+    except Exception as e:
+        logger.error(f"Failed {filename}: {e}")
+        return {"status": "error", "error": str(e), "file": str(resume_path)}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 9. BATCH PROCESS FOLDER (WITH PARALLEL PROCESSING)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def process_folder_parallel(folder_path, max_workers=2):
+    """Process all resumes in parallel (YOUR VERSION)"""
+    folder = Path(folder_path)
+    if not folder.exists():
+        logger.error(f"Folder not found: {folder_path}")
+        return None
+    
+    pdf_files = list(folder.glob("*.pdf"))
+    if not pdf_files:
+        logger.error(f"No PDF files found in: {folder_path}")
+        return None
+    
+    results = {
+        "total_resumes": len(pdf_files),
+        "processed_at": datetime.now().isoformat(),
+        "resumes": []
+    }
+    
+    logger.info(f"Found {len(pdf_files)} resume(s)")
+    logger.info(f"Processing with {max_workers} parallel worker(s)\n")
+    
+    processed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_resume, str(pdf_file)): pdf_file for pdf_file in pdf_files}
+        
+        for future in as_completed(futures):
+            pdf_file = futures[future]
+            processed += 1
+            try:
+                data = future.result()
+                results["resumes"].append(data)
+            except Exception as e:
+                logger.error(f"[{processed}/{len(pdf_files)}] {pdf_file.name}: {str(e)}")
+    
+    return results
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 10. EXPORT TO JSON
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def export_to_json(results):
+    """Export results to JSON file"""
+    output_file = f"resume_database_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    
+    logger.info(f"💾 Saved to: {output_file}")
+    return output_file
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 11. PRINT JSON FOR CHATBOT
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def print_json_for_chatbot(results):
+    """Print JSON for easy copying to chatbot"""
+    print("\n" + "=" * 100)
+    print("📋 COPY THIS JSON FOR THE CHATBOT")
+    print("=" * 100)
+    print("\n⬇️ START COPYING BELOW ⬇️\n")
+    
+    json_str = json.dumps(results, indent=2, ensure_ascii=False)
+    print(json_str)
+    
+    print("\n⬆️ END COPYING ABOVE ⬆️\n")
+    print("=" * 100)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 12. MAIN
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if __name__ == "__main__":
+    print("\n" + "=" * 100)
+    print("🚀 RESUME PARSER v7.0 - Complete with Your Exact Logic")
+    print("=" * 100)
+    
+    # CONFIGURATION
+    folder_path = r"C:\Users\psidd\Desktop\resume_chatbot"
+    
+    start_time = datetime.now()
+    
+    # Process all resumes
+    results = process_folder_parallel(folder_path, max_workers=2)
+    
+    if results:
+        # Save to file
+        export_to_json(results)
+        
+        # Print for copying
+        print_json_for_chatbot(results)
+        
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        print("=" * 100)
+        print(f"✅ Complete! ({duration:.1f}s | {len(results['resumes'])} resumes)")
+        print("=" * 100)
