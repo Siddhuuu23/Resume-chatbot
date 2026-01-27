@@ -1,0 +1,824 @@
+import http.server
+import socketserver
+import webbrowser
+import os
+import json
+from pathlib import Path
+import time
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HTML TEMPLATE WITH AUTO-LOAD
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resume Chatbot - AI Powered</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            height: 90vh;
+        }
+
+        .sidebar {
+            background: linear-gradient(180deg, #2d3748 0%, #1a202c 100%);
+            color: white;
+            padding: 30px 20px;
+            overflow-y: auto;
+        }
+
+        .sidebar h2 {
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+            color: #667eea;
+        }
+
+        .stats {
+            background: rgba(255,255,255,0.1);
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 0.9rem;
+        }
+
+        .stat-value {
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .filter-section {
+            margin-top: 20px;
+        }
+
+        .filter-section h3 {
+            font-size: 1rem;
+            margin-bottom: 10px;
+            color: #a0aec0;
+        }
+
+        .filter-btn {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 8px;
+            background: rgba(102, 126, 234, 0.2);
+            border: 1px solid #667eea;
+            color: white;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 0.9rem;
+        }
+
+        .filter-btn:hover {
+            background: #667eea;
+            transform: translateX(5px);
+        }
+
+        .filter-btn.active {
+            background: #667eea;
+        }
+
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+
+        .chat-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .chat-header h1 {
+            font-size: 1.8rem;
+        }
+
+        .clear-btn {
+            padding: 10px 20px;
+            background: white;
+            color: #667eea;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+
+        .clear-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 30px;
+            padding-bottom: 10px;
+            background: #f7fafc;
+            max-height: calc(90vh - 200px);
+        }
+
+        .chat-messages::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .chat-messages::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 4px;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb:hover {
+            background: #5568d3;
+        }
+
+        .message {
+            margin-bottom: 20px;
+            display: flex;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message.user {
+            justify-content: flex-end;
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 15px 20px;
+            border-radius: 18px;
+            line-height: 1.5;
+        }
+
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 5px;
+        }
+
+        .message.bot .message-content {
+            background: white;
+            color: #2d3748;
+            border-bottom-left-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .message.bot .message-content strong {
+            color: #667eea;
+        }
+
+        .typing-indicator {
+            display: none;
+            padding: 15px 20px;
+            background: white;
+            border-radius: 18px;
+            width: fit-content;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 10px;
+            position: relative;
+        }
+
+        .typing-indicator.active {
+            display: block;
+        }
+
+        .typing-indicator span {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #667eea;
+            border-radius: 50%;
+            margin: 0 2px;
+            animation: bounce 1.4s infinite;
+        }
+
+        .typing-indicator span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-indicator span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes bounce {
+            0%, 60%, 100% {
+                transform: translateY(0);
+            }
+            30% {
+                transform: translateY(-10px);
+            }
+        }
+
+        .chat-input-container {
+            padding: 20px 30px;
+            background: white;
+            border-top: 1px solid #e2e8f0;
+            position: relative;
+            bottom: 0;
+            width: 100%;
+        }
+
+        .chat-input-wrapper {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .chat-input {
+            flex: 1;
+            padding: 15px 20px;
+            border: 2px solid #e2e8f0;
+            border-radius: 25px;
+            font-size: 1rem;
+            outline: none;
+            transition: all 0.3s;
+        }
+
+        .chat-input:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .send-btn {
+            padding: 15px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+
+        .send-btn:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .quick-questions {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        .quick-question {
+            padding: 8px 15px;
+            background: white;
+            border: 2px solid #667eea;
+            color: #667eea;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.3s;
+        }
+
+        .quick-question:hover {
+            background: #667eea;
+            color: white;
+        }
+
+        .candidate-card {
+            background: rgba(255,255,255,0.1);
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: 1px solid rgba(102, 126, 234, 0.3);
+        }
+
+        .candidate-card:hover {
+            transform: translateX(5px);
+            background: rgba(102, 126, 234, 0.2);
+            border-color: #667eea;
+        }
+
+        .candidate-name {
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+
+        .candidate-info {
+            font-size: 0.85rem;
+            color: #a0aec0;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .status-indicator.connected {
+            background: #48bb78;
+            box-shadow: 0 0 10px #48bb78;
+        }
+
+        .status-indicator.disconnected {
+            background: #f56565;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <h2>📊 Resume Database</h2>
+            
+            <div class="stats">
+                <div class="stat-item">
+                    <span>Total Candidates:</span>
+                    <span class="stat-value" id="totalCandidates">0</span>
+                </div>
+                <div class="stat-item">
+                    <span>Avg Experience:</span>
+                    <span class="stat-value" id="avgExperience">0 yrs</span>
+                </div>
+                <div class="stat-item">
+                    <span>Status:</span>
+                    <span>
+                        <span class="status-indicator disconnected" id="statusIndicator"></span>
+                        <span id="statusText">Loading...</span>
+                    </span>
+                </div>
+            </div>
+
+            <div class="filter-section">
+                <h3>🔍 Quick Filters</h3>
+                <button class="filter-btn" onclick="applyFilter('all')">All Candidates</button>
+                <button class="filter-btn" onclick="applyFilter('exp>5')">Experience > 5 years</button>
+                <button class="filter-btn" onclick="applyFilter('exp<3')">Experience < 3 years</button>
+                <button class="filter-btn" onclick="applyFilter('bachelor')">Bachelor's Degree</button>
+                <button class="filter-btn" onclick="applyFilter('master')">Master's Degree</button>
+            </div>
+
+            <div class="filter-section">
+                <h3>👥 Candidates</h3>
+                <div id="candidateList"></div>
+            </div>
+        </div>
+
+        <!-- Chat Container -->
+        <div class="chat-container">
+            <div class="chat-header">
+                <h1>🤖 Resume Chatbot</h1>
+                <button class="clear-btn" onclick="clearChat()">🗑️ Clear Chat</button>
+            </div>
+
+            <div class="chat-messages" id="chatMessages">
+                <div class="message bot">
+                    <div class="message-content">
+                        👋 <strong>Welcome to Resume Chatbot!</strong><br><br>
+                        Loading your resume database...<br><br>
+                        You can ask me questions like:<br>
+                        • "Who has Python skills?"<br>
+                        • "Find candidates with 5+ years experience"<br>
+                        • "Show me hardware engineers"<br>
+                        • "Who graduated from top universities?"
+                    </div>
+                </div>
+                <div class="typing-indicator" id="typingIndicator">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+            </div>
+
+            <div class="chat-input-container">
+                <div class="quick-questions" id="quickQuestions" style="display: none;">
+                    <div class="quick-question" onclick="askQuestion('Who has the most experience?')">
+                        Most experienced?
+                    </div>
+                    <div class="quick-question" onclick="askQuestion('Show candidates with Python skills')">
+                        Python skills?
+                    </div>
+                    <div class="quick-question" onclick="askQuestion('Find hardware engineers')">
+                        Hardware engineers?
+                    </div>
+                    <div class="quick-question" onclick="askQuestion('Who has Azure certifications?')">
+                        Cloud certified?
+                    </div>
+                </div>
+                <div class="chat-input-wrapper">
+                    <input 
+                        type="text" 
+                        class="chat-input" 
+                        id="userInput" 
+                        placeholder="Ask about candidates..."
+                        disabled
+                        onkeypress="if(event.key === 'Enter') sendMessage()"
+                    >
+                    <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>
+                        Send ✈️
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let resumeData = null;
+
+        // Auto-load JSON on page load
+        window.onload = async function() {
+            try {
+                const response = await fetch('resume_data.json');
+                if (!response.ok) {
+                    throw new Error('Failed to load resume data');
+                }
+                
+                const data = await response.json();
+                resumeData = data;
+                
+                // Filter successful resumes
+                const successfulResumes = data.resumes.filter(r => r.status === 'success');
+                
+                // Update stats
+                document.getElementById('totalCandidates').textContent = successfulResumes.length;
+                
+                const avgExp = successfulResumes.reduce((sum, r) => 
+                    sum + (r.work_experience?.total_years || 0), 0) / successfulResumes.length;
+                document.getElementById('avgExperience').textContent = avgExp.toFixed(1) + ' yrs';
+                
+                document.getElementById('statusIndicator').className = 'status-indicator connected';
+                document.getElementById('statusText').textContent = 'Ready';
+                
+                // Enable chat input
+                document.getElementById('userInput').disabled = false;
+                document.getElementById('sendBtn').disabled = false;
+                document.getElementById('quickQuestions').style.display = 'flex';
+                
+                // Update candidate list
+                updateCandidateList(successfulResumes);
+                
+                // Add success message
+                addBotMessage(`✅ Loaded ${successfulResumes.length} candidates successfully! You can now ask me questions.`);
+                
+            } catch (error) {
+                document.getElementById('statusIndicator').className = 'status-indicator disconnected';
+                document.getElementById('statusText').textContent = 'Error';
+                addBotMessage(`❌ Error loading resume data: ${error.message}`);
+            }
+        };
+
+        // Update candidate list in sidebar
+        function updateCandidateList(candidates) {
+            const list = document.getElementById('candidateList');
+            list.innerHTML = '';
+            
+            candidates.slice(0, 10).forEach(candidate => {
+                const card = document.createElement('div');
+                card.className = 'candidate-card';
+                card.innerHTML = `
+                    <div class="candidate-name">${candidate.name}</div>
+                    <div class="candidate-info">
+                        💼 ${candidate.work_experience?.total_years || 0} years
+                    </div>
+                `;
+                card.onclick = () => askQuestion(`Tell me about ${candidate.name}`);
+                list.appendChild(card);
+            });
+        }
+
+        // Apply quick filter
+        function applyFilter(filter) {
+            if (!resumeData) return;
+            
+            const buttons = document.querySelectorAll('.filter-btn');
+            buttons.forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            let question = '';
+            switch(filter) {
+                case 'all':
+                    question = 'Show me all candidates with their experience and skills';
+                    break;
+                case 'exp>5':
+                    question = 'Find candidates with more than 5 years experience';
+                    break;
+                case 'exp<3':
+                    question = 'Find candidates with less than 3 years experience';
+                    break;
+                case 'bachelor':
+                    question = "Show candidates with Bachelor's degree";
+                    break;
+                case 'master':
+                    question = "Show candidates with Master's degree";
+                    break;
+            }
+            
+            askQuestion(question);
+        }
+
+        // Send message
+        async function sendMessage() {
+            const input = document.getElementById('userInput');
+            const message = input.value.trim();
+            
+            if (!message || !resumeData) return;
+            
+            input.value = '';
+            addUserMessage(message);
+            await getBotResponse(message);
+        }
+
+        // Ask predefined question
+        function askQuestion(question) {
+            document.getElementById('userInput').value = question;
+            sendMessage();
+        }
+
+        // Add user message to chat
+        function addUserMessage(text) {
+            const messagesContainer = document.getElementById('chatMessages');
+            const typingIndicator = document.getElementById('typingIndicator');
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message user';
+            messageDiv.innerHTML = `<div class="message-content">${text}</div>`;
+            
+            // Insert before typing indicator
+            messagesContainer.insertBefore(messageDiv, typingIndicator);
+            
+            // Scroll to bottom
+            setTimeout(() => {
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            }, 100);
+        }
+
+        // Add bot message to chat
+        function addBotMessage(text) {
+            const messagesContainer = document.getElementById('chatMessages');
+            const typingIndicator = document.getElementById('typingIndicator');
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message bot';
+            messageDiv.innerHTML = `<div class="message-content">${text}</div>`;
+            
+            // Insert before typing indicator
+            messagesContainer.insertBefore(messageDiv, typingIndicator);
+            
+            // Scroll to bottom
+            setTimeout(() => {
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            }, 100);
+        }
+
+        // Get bot response using Ollama
+        async function getBotResponse(userQuestion) {
+            const typingIndicator = document.getElementById('typingIndicator');
+            typingIndicator.classList.add('active');
+            
+            try {
+                // Build context from resume data
+                const successfulResumes = resumeData.resumes.filter(r => r.status === 'success');
+                const context = buildContext(successfulResumes);
+                
+                // Create prompt
+                
+                const prompt = `You are a helpful recruitment assistant. Answer questions about candidates based on the resume database.
+
+RESUME DATABASE:
+${context}
+
+USER QUESTION: ${userQuestion}
+
+INSTRUCTIONS:
+1. Answer based ONLY on the resume data provided above
+2. When mentioning candidates, format as: **Name** (Experience: X years)
+3. Be specific - mention experience years, qualifications, key skills
+4. If multiple candidates match, list them with bullet points
+5. If no candidates match, say so clearly
+6. Keep answers concise and well-formatted
+7. Use emojis to make responses engaging (💼 for experience, 🎓 for education, 🛠️ for skills)
+
+Answer:`;
+
+                // Call Ollama API
+                const response = await fetch('http://127.0.0.1:11434/api/generate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        model: 'llama3.2:1b',
+                        prompt: prompt,
+                        stream: false,
+                        options: {
+                            temperature: 0.7,
+                            top_p: 0.9
+                        }
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Ollama API error: ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                const answer = data.response.trim();
+                
+                typingIndicator.classList.remove('active');
+                addBotMessage(answer);
+                
+            } catch (error) {
+                typingIndicator.classList.remove('active');
+                addBotMessage(`❌ Error: ${error.message}<br><br>⚠️ Please make sure Ollama is running:<br><code>ollama serve</code><br><code>ollama pull llama3.2:1b</code>`);
+            }
+        }
+
+        // Build context from resume data
+        function buildContext(resumes) {
+            let context = '';
+            
+            resumes.forEach((resume, idx) => {
+                const workExp = resume.work_experience || {};
+                const quals = resume.qualifications || {};
+                const highestQual = quals.highest_qualification || {};
+                const skillsDict = resume.technical_skills || {};
+                
+                // Flatten all skills
+                const allSkills = [];
+                Object.values(skillsDict).forEach(skillArray => {
+                    if (Array.isArray(skillArray)) {
+                        allSkills.push(...skillArray.slice(0, 5));
+                    }
+                });
+                
+                context += `
+Candidate ${idx + 1}:
+- Name: ${resume.name}
+- File: ${resume.filename}
+- Experience: ${workExp.total_years || 0} years
+- Degree: ${highestQual.qualification_name || 'N/A'} from ${highestQual.college_name || 'N/A'} (${highestQual.graduation_year || 'N/A'})
+- Skills: ${allSkills.slice(0, 10).join(', ') || 'None listed'}
+
+`;
+            });
+            
+            return context;
+        }
+
+        // Clear chat
+        function clearChat() {
+            const messagesContainer = document.getElementById('chatMessages');
+            const typingIndicator = document.getElementById('typingIndicator');
+            
+            messagesContainer.innerHTML = `
+                <div class="message bot">
+                    <div class="message-content">
+                        Chat cleared! ✨ Ask me another question about the candidates.
+                    </div>
+                </div>
+            `;
+            
+            messagesContainer.appendChild(typingIndicator);
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CREATE HTML FILE AND START SERVER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def setup_chatbot():
+    """Setup chatbot HTML and start web server"""
+    
+    print("=" * 80)
+    print("🚀 RESUME CHATBOT - Web Server Setup")
+    print("=" * 80)
+    
+    # Find latest JSON file
+    json_files = sorted(Path(".").glob("resume_database_*.json"), reverse=True)
+    
+    if not json_files:
+        print("\n❌ No resume database JSON found!")
+        print("Please run the resume parser first to generate the JSON file.")
+        return
+    
+    json_file = json_files[0]
+    print(f"\n📁 Found JSON: {json_file}")
+    
+    # Copy JSON to resume_data.json for auto-loading
+    try:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        with open('resume_data.json', 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Copied to: resume_data.json")
+        
+    except Exception as e:
+        print(f"❌ Error copying JSON: {e}")
+        return
+    
+    # Create HTML file
+    try:
+        with open('resume_chatbot.html', 'w', encoding='utf-8') as f:
+            f.write(HTML_TEMPLATE)
+        
+        print(f"✅ Created: resume_chatbot.html")
+        
+    except Exception as e:
+        print(f"❌ Error creating HTML: {e}")
+        return
+    
+    # Start web server
+    PORT = 8000
+    
+    print(f"\n🌐 Starting web server on port {PORT}...")
+    print(f"📊 Loaded {len(data.get('resumes', []))} resumes")
+    
+    try:
+        Handler = http.server.SimpleHTTPRequestHandler
+        
+        with socketserver.TCPServer(("", PORT), Handler) as httpd:
+            url = f"http://localhost:{PORT}/resume_chatbot.html"
+            
+            print(f"\n✅ Server running!")
+            print("=" * 80)
+            print(f"🔗 Open in browser: {url}")
+            print("=" * 80)
+            print(f"\n⚠️  IMPORTANT: Make sure Ollama is running:")
+            print(f"   ollama serve")
+            print(f"   ollama pull llama3.2:1b")
+            print("\n🛑 Press Ctrl+C to stop the server\n")
+            
+            # Auto-open browser
+            time.sleep(1)
+            webbrowser.open(url)
+            
+            # Serve forever
+            httpd.serve_forever()
+            
+    except KeyboardInterrupt:
+        print("\n\n👋 Server stopped!")
+    except OSError as e:
+        if "Address already in use" in str(e):
+            print(f"\n❌ Port {PORT} is already in use!")
+            print(f"Try opening: http://localhost:{PORT}/resume_chatbot.html")
+        else:
+            print(f"\n❌ Error starting server: {e}")
+
+
+if __name__ == "__main__":
+    setup_chatbot()
