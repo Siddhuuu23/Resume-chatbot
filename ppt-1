@@ -1,0 +1,629 @@
+"""
+AI-Powered PPT Generator v2 — Full Formatting + Schema-Aware
+=============================================================
+
+WHAT'S NEW vs v1:
+- Extracts FULL formatting from old PPT (fonts, colors, sizes, bold/italic,
+  alignment, background colors, placeholder positions & sizes)
+- Builds a "data schema" so Claude understands which fields are
+  product-specific (will change) vs structural (stay the same)
+- New PPT is styled to EXACTLY match the old PPT's look and feel
+
+FOLDER STRUCTURE — add your files here before running:
+-------------------------------------------------------
+input/
+├── old_ppt/           ← Your OLD .pptx file  (e.g. product_old.pptx)
+├── excel_data/        ← Your Excel file(s)   (e.g. product_data.xlsx)
+└── new_product_info/  ← A .txt file with new product details
+
+output/                ← Generated PPT saved here
+
+HOW TO RUN:
+-----------
+1. pip install anthropic python-pptx openpyxl pandas
+2. export ANTHROPIC_API_KEY="your-key-here"
+3. Add files to input/ folders
+4. python ppt_generator_v2.py
+"""
+
+import os
+import re
+import glob
+import json
+import anthropic
+import pandas as pd
+from copy import deepcopy
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+
+# ============================================================
+#  CONFIGURATION
+# ============================================================
+
+INPUT_OLD_PPT_FOLDER    = "input/old_ppt"
+INPUT_EXCEL_FOLDER      = "input/excel_data"
+INPUT_NEW_INFO_FOLDER   = "input/new_product_info"
+OUTPUT_FOLDER           = "output"
+OUTPUT_FILENAME         = "new_product_ppt.pptx"
+
+CLAUDE_MODEL            = "claude-opus-4-5"
+MAX_TOKENS              = 8096
+
+# ============================================================
+#  STEP 1 — EXTRACT FULL FORMATTING FROM OLD PPT
+# ============================================================
+
+def rgb_to_hex(rgb):
+    """Convert RGBColor to hex string."""
+    try:
+        return "#{:02X}{:02X}{:02X}".format(rgb[0], rgb[1], rgb[2])
+    except Exception:
+        return None
+
+
+def extract_paragraph_format(para):
+    """Extract full formatting details from a paragraph."""
+    fmt = {
+        "text": para.text,
+        "alignment": str(para.alignment) if para.alignment else "LEFT",
+        "level": para.level,
+        "runs": []
+    }
+    for run in para.runs:
+        run_fmt = {
+            "text": run.text,
+            "bold": run.font.bold,
+            "italic": run.font.italic,
+            "underline": run.font.underline,
+            "font_size_pt": run.font.size.pt if run.font.size else None,
+            "font_name": run.font.name,
+            "font_color_hex": rgb_to_hex(run.font.color.rgb) if (
+                run.font.color and run.font.color.type
+            ) else None,
+        }
+        fmt["runs"].append(run_fmt)
+    return fmt
+
+
+def extract_shape_format(shape):
+    """Extract position, size, fill, and text formatting from a shape."""
+    shape_info = {
+        "shape_id":   shape.shape_id,
+        "shape_name": shape.name,
+        "shape_type": str(shape.shape_type),
+        "left_emu":   shape.left,
+        "top_emu":    shape.top,
+        "width_emu":  shape.width,
+        "height_emu": shape.height,
+        "is_placeholder": shape.is_placeholder,
+        "placeholder_idx": shape.placeholder_format.idx if shape.is_placeholder else None,
+        "paragraphs": []
+    }
+
+    # Fill color
+    try:
+        fill = shape.fill
+        if fill.type is not None:
+            shape_info["fill_type"] = str(fill.type)
+            if hasattr(fill, "fore_color") and fill.fore_color.type:
+                shape_info["fill_color_hex"] = rgb_to_hex(fill.fore_color.rgb)
+    except Exception:
+        pass
+
+    # Text + paragraph formatting
+    if shape.has_text_frame:
+        for para in shape.text_frame.paragraphs:
+            shape_info["paragraphs"].append(extract_paragraph_format(para))
+
+    return shape_info
+
+
+def extract_slide_background(slide):
+    """Extract slide background color if set."""
+    try:
+        bg = slide.background
+        fill = bg.fill
+        if fill.type is not None and hasattr(fill, "fore_color"):
+            return rgb_to_hex(fill.fore_color.rgb)
+    except Exception:
+        pass
+    return None
+
+
+def read_old_ppt_full(folder: str):
+    """
+    Read old PPT and extract:
+    - Full slide structure with text content
+    - Complete formatting (fonts, colors, sizes, positions)
+    - Layout names per slide
+    Returns: (prs object, structured_info dict)
+    """
+    pptx_files = glob.glob(os.path.join(folder, "*.pptx"))
+    if not pptx_files:
+        print(f"[WARNING] No .pptx found in '{folder}'.")
+        return None, {"slides": []}
+
+    path = pptx_files[0]
+    print(f"[INFO] Reading old PPT with full formatting: {path}")
+    prs = Presentation(path)
+
+    slides_info = []
+    for i, slide in enumerate(prs.slides):
+        slide_data = {
+            "slide_number":  i + 1,
+            "layout_name":   slide.slide_layout.name,
+            "background_color": extract_slide_background(slide),
+            "shapes": []
+        }
+        for shape in slide.shapes:
+            slide_data["shapes"].append(extract_shape_format(shape))
+
+        slides_info.append(slide_data)
+
+    result = {
+        "total_slides":  len(prs.slides),
+        "slide_width_emu":  prs.slide_width,
+        "slide_height_emu": prs.slide_height,
+        "slides": slides_info
+    }
+    print(f"[INFO] Extracted {len(slides_info)} slides with full formatting.")
+    return prs, result
+
+
+# ============================================================
+#  STEP 2 — BUILD DATA SCHEMA (what changes vs what stays)
+# ============================================================
+
+def build_data_schema(old_ppt_info: dict, excel_data: str) -> dict:
+    """
+    Analyze the old PPT structure and Excel columns to build a schema
+    that tells Claude which fields are product-variable vs structural.
+    """
+    # Collect all text from all slides
+    all_texts = []
+    for slide in old_ppt_info["slides"]:
+        for shape in slide["shapes"]:
+            for para in shape.get("paragraphs", []):
+                t = para.get("text", "").strip()
+                if t:
+                    all_texts.append({
+                        "slide": slide["slide_number"],
+                        "layout": slide["layout_name"],
+                        "text": t
+                    })
+
+    # Heuristic: classify texts as structural vs product-data
+    structural_keywords = [
+        "agenda", "overview", "introduction", "contact", "thank",
+        "contents", "table of", "disclaimer", "confidential",
+        "prepared by", "date", "version", "©", "copyright"
+    ]
+    product_keywords = [
+        "price", "cost", "feature", "spec", "model", "product",
+        "capacity", "weight", "size", "color", "warranty",
+        "available", "dimension", "material", "power", "speed",
+        "sku", "code", "id", "quantity", "description"
+    ]
+
+    structural_texts = []
+    variable_texts   = []
+
+    for item in all_texts:
+        t_lower = item["text"].lower()
+        if any(kw in t_lower for kw in structural_keywords):
+            structural_texts.append(item)
+        elif any(kw in t_lower for kw in product_keywords):
+            variable_texts.append(item)
+        else:
+            # Short labels are likely field headers (structural)
+            if len(item["text"].split()) <= 4:
+                structural_texts.append(item)
+            else:
+                variable_texts.append(item)
+
+    # Parse Excel columns as known data fields
+    excel_columns = []
+    for line in excel_data.split("\n"):
+        if line.strip():
+            cols = [c.strip() for c in line.split("  ") if c.strip()]
+            if cols:
+                excel_columns = cols
+                break  # first non-empty line is usually headers
+
+    schema = {
+        "structural_elements": [t["text"] for t in structural_texts[:20]],
+        "variable_elements":   [t["text"] for t in variable_texts[:20]],
+        "excel_data_columns":  excel_columns,
+        "slide_layouts_used":  list({s["layout_name"] for s in old_ppt_info["slides"]}),
+        "total_slides_in_template": old_ppt_info["total_slides"]
+    }
+
+    print(f"[INFO] Schema built — {len(schema['structural_elements'])} structural, "
+          f"{len(schema['variable_elements'])} variable elements.")
+    return schema
+
+
+# ============================================================
+#  STEP 3 — READ EXCEL + NEW PRODUCT INFO
+# ============================================================
+
+def read_excel_data(folder: str) -> str:
+    excel_files = glob.glob(os.path.join(folder, "*.xlsx")) + \
+                  glob.glob(os.path.join(folder, "*.xls"))
+    if not excel_files:
+        print(f"[WARNING] No Excel file found in '{folder}'.")
+        return "No Excel data provided."
+
+    all_data = []
+    for path in excel_files:
+        print(f"[INFO] Reading Excel: {path}")
+        xl = pd.ExcelFile(path)
+        for sheet in xl.sheet_names:
+            df = xl.parse(sheet).fillna("")
+            all_data.append(f"Sheet [{sheet}]:\n{df.to_string(index=False)}")
+
+    return "\n\n".join(all_data)
+
+
+def read_new_product_info(folder: str) -> str:
+    txt_files = glob.glob(os.path.join(folder, "*.txt"))
+    if not txt_files:
+        print(f"[WARNING] No .txt file found in '{folder}'.")
+        return "No new product info provided."
+
+    contents = []
+    for path in txt_files:
+        print(f"[INFO] Reading new product info: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            contents.append(f.read())
+    return "\n\n".join(contents)
+
+
+# ============================================================
+#  STEP 4 — CLAUDE: UNDERSTAND SCHEMA + GENERATE SLIDES
+# ============================================================
+
+def generate_slides_with_claude(
+    old_ppt_info: dict,
+    data_schema:  dict,
+    excel_data:   str,
+    new_product_info: str
+) -> list:
+    """
+    Two-phase Claude call:
+    Phase 1 — Claude analyzes the schema to understand what varies per product.
+    Phase 2 — Claude generates new slide content for the new product.
+    """
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+    # Build a compact but rich view of the old PPT formatting
+    formatting_summary = []
+    for slide in old_ppt_info["slides"]:
+        slide_fmt = {
+            "slide_number": slide["slide_number"],
+            "layout": slide["layout_name"],
+            "background": slide.get("background_color"),
+            "content_blocks": []
+        }
+        for shape in slide["shapes"]:
+            if not shape["paragraphs"]:
+                continue
+            block = {
+                "shape_name": shape["shape_name"],
+                "is_placeholder": shape["is_placeholder"],
+                "placeholder_idx": shape["placeholder_idx"],
+                "position": {
+                    "left_pct":   round(shape["left_emu"] / old_ppt_info["slide_width_emu"] * 100, 1),
+                    "top_pct":    round(shape["top_emu"]  / old_ppt_info["slide_height_emu"] * 100, 1),
+                    "width_pct":  round(shape["width_emu"] / old_ppt_info["slide_width_emu"] * 100, 1),
+                    "height_pct": round(shape["height_emu"]/ old_ppt_info["slide_height_emu"] * 100, 1),
+                },
+                "fill_color": shape.get("fill_color_hex"),
+                "paragraphs": []
+            }
+            for para in shape["paragraphs"]:
+                p_fmt = {
+                    "text":      para["text"],
+                    "alignment": para["alignment"],
+                    "level":     para["level"],
+                }
+                if para["runs"]:
+                    r = para["runs"][0]  # use first run's format as representative
+                    p_fmt.update({
+                        "bold":       r["bold"],
+                        "italic":     r["italic"],
+                        "font_size":  r["font_size_pt"],
+                        "font_name":  r["font_name"],
+                        "font_color": r["font_color_hex"],
+                    })
+                block["paragraphs"].append(p_fmt)
+            slide_fmt["content_blocks"].append(block)
+        formatting_summary.append(slide_fmt)
+
+    prompt = f"""
+You are an expert presentation designer and data analyst.
+
+I will give you:
+1. OLD PPT formatting — full structure, fonts, colors, positions, layout per slide
+2. DATA SCHEMA — which parts of the old PPT are STRUCTURAL (stay same across products)
+   vs VARIABLE (change for each new product)
+3. EXCEL DATA — actual data for the new product
+4. NEW PRODUCT INFO — description of the new product
+
+YOUR JOB:
+- Study the old PPT's data schema carefully. Understand the PATTERN of what changes.
+  For example: if the old PPT had "Product: Widget A, Price: $10, Features: X, Y, Z",
+  the NEW PPT should follow the same structure but with the new product's values.
+- Identify every VARIABLE field (product name, specs, price, features, images, etc.)
+  and replace them with the new product's equivalents from the Excel + new product info.
+- Keep all STRUCTURAL elements (company name, slide titles, section headers, design, layout) unchanged.
+- Respect the exact formatting: same fonts, font sizes, colors, bold/italic, alignment per slide.
+- Generate the same number of slides as the old PPT ({old_ppt_info['total_slides']} slides).
+
+RETURN FORMAT — a valid JSON array only, no explanation, no markdown fences:
+[
+  {{
+    "slide_number": 1,
+    "layout_name": "exact layout name from old PPT",
+    "background_color": "#RRGGBB or null",
+    "shapes": [
+      {{
+        "shape_name": "exact shape name from old PPT",
+        "placeholder_idx": 0,
+        "paragraphs": [
+          {{
+            "text": "new text for this paragraph",
+            "alignment": "LEFT|CENTER|RIGHT",
+            "level": 0,
+            "bold": true,
+            "italic": false,
+            "font_size": 24,
+            "font_name": "Calibri",
+            "font_color": "#1F497D"
+          }}
+        ]
+      }}
+    ],
+    "notes": "speaker notes if any"
+  }}
+]
+
+---
+1. OLD PPT FORMATTING (per slide):
+{json.dumps(formatting_summary, indent=2)}
+
+---
+2. DATA SCHEMA (structural vs variable):
+STRUCTURAL ELEMENTS (keep as-is):
+{json.dumps(data_schema['structural_elements'], indent=2)}
+
+VARIABLE ELEMENTS (replace with new product data):
+{json.dumps(data_schema['variable_elements'], indent=2)}
+
+EXCEL COLUMNS AVAILABLE: {data_schema['excel_data_columns']}
+SLIDE LAYOUTS USED: {data_schema['slide_layouts_used']}
+
+---
+3. EXCEL DATA FOR NEW PRODUCT:
+{excel_data}
+
+---
+4. NEW PRODUCT INFORMATION:
+{new_product_info}
+
+---
+Now generate the JSON array. Match the old PPT's formatting exactly for every shape.
+Replace only the product-specific variable content. Return JSON only.
+"""
+
+    print("[INFO] Calling Claude API (schema-aware, formatting-preserved)...")
+    message = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_TOKENS,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw = message.content[0].text.strip()
+
+    # Strip markdown fences if present
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+
+    slides = json.loads(raw)
+    print(f"[INFO] Claude generated content for {len(slides)} slides.")
+    return slides
+
+
+# ============================================================
+#  STEP 5 — BUILD NEW PPT WITH PRESERVED FORMATTING
+# ============================================================
+
+ALIGN_MAP = {
+    "LEFT":    PP_ALIGN.LEFT,
+    "CENTER":  PP_ALIGN.CENTER,
+    "RIGHT":   PP_ALIGN.RIGHT,
+    "JUSTIFY": PP_ALIGN.JUSTIFY,
+}
+
+
+def hex_to_rgb(hex_color: str):
+    """Convert '#RRGGBB' to (R, G, B) tuple."""
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+def apply_paragraph_format(para, para_data: dict):
+    """Apply font, alignment, color from Claude's output to a paragraph."""
+    para.clear()  # remove default runs
+
+    text = para_data.get("text", "")
+    if not text:
+        return
+
+    run = para.add_run()
+    run.text = text
+
+    font = run.font
+
+    size = para_data.get("font_size")
+    if size:
+        font.size = Pt(size)
+
+    name = para_data.get("font_name")
+    if name:
+        font.name = name
+
+    if para_data.get("bold") is not None:
+        font.bold = para_data["bold"]
+
+    if para_data.get("italic") is not None:
+        font.italic = para_data["italic"]
+
+    color_hex = para_data.get("font_color")
+    if color_hex:
+        try:
+            r, g, b = hex_to_rgb(color_hex)
+            font.color.rgb = RGBColor(r, g, b)
+        except Exception:
+            pass
+
+    alignment_str = para_data.get("alignment", "LEFT").upper()
+    para.alignment = ALIGN_MAP.get(alignment_str, PP_ALIGN.LEFT)
+
+    para.level = para_data.get("level", 0)
+
+
+def build_pptx_formatted(
+    old_prs,
+    old_ppt_info: dict,
+    generated_slides: list,
+    output_path: str
+):
+    """
+    Build the new PPT by:
+    1. Copying the old PPT as the base (preserves master/theme)
+    2. Updating each slide's text content with Claude's output
+    3. Applying all formatting from Claude's response
+    """
+    # Start from a copy of the old PPT to preserve theme/master
+    import shutil
+    old_path = glob.glob(os.path.join(INPUT_OLD_PPT_FOLDER, "*.pptx"))[0]
+    tmp_path  = os.path.join(OUTPUT_FOLDER, "_tmp_base.pptx")
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    shutil.copy2(old_path, tmp_path)
+
+    prs = Presentation(tmp_path)
+
+    # Build lookup: slide_number → generated slide data
+    gen_map = {s["slide_number"]: s for s in generated_slides}
+
+    for i, slide in enumerate(prs.slides):
+        slide_num = i + 1
+        gen_slide = gen_map.get(slide_num)
+        if not gen_slide:
+            continue
+
+        # Update background color if specified
+        bg_color = gen_slide.get("background_color")
+        if bg_color:
+            try:
+                r, g, b = hex_to_rgb(bg_color)
+                bg = slide.background
+                fill = bg.fill
+                fill.solid()
+                fill.fore_color.rgb = RGBColor(r, g, b)
+            except Exception:
+                pass
+
+        # Build lookup of generated shapes by name and placeholder_idx
+        gen_shapes_by_name = {s["shape_name"]: s for s in gen_slide.get("shapes", [])}
+        gen_shapes_by_idx  = {s["placeholder_idx"]: s
+                               for s in gen_slide.get("shapes", [])
+                               if s.get("placeholder_idx") is not None}
+
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+
+            # Match by shape name first, then placeholder idx
+            gen_shape = gen_shapes_by_name.get(shape.name)
+            if not gen_shape and shape.is_placeholder:
+                gen_shape = gen_shapes_by_idx.get(shape.placeholder_format.idx)
+
+            if not gen_shape:
+                continue
+
+            tf = shape.text_frame
+            gen_paragraphs = gen_shape.get("paragraphs", [])
+
+            # Expand or shrink paragraphs to match generated count
+            while len(tf.paragraphs) < len(gen_paragraphs):
+                tf.add_paragraph()
+
+            for j, para_data in enumerate(gen_paragraphs):
+                if j < len(tf.paragraphs):
+                    apply_paragraph_format(tf.paragraphs[j], para_data)
+
+            # Clear any extra paragraphs beyond what Claude generated
+            while len(tf.paragraphs) > len(gen_paragraphs):
+                p = tf.paragraphs[-1]._p
+                p.getparent().remove(p)
+
+        # Add speaker notes
+        notes_text = gen_slide.get("notes", "")
+        if notes_text:
+            notes_slide = slide.notes_slide
+            notes_slide.notes_text_frame.text = notes_text
+
+    prs.save(output_path)
+    os.remove(tmp_path)
+    print(f"[SUCCESS] Formatted PPT saved to: {output_path}")
+
+
+# ============================================================
+#  MAIN
+# ============================================================
+
+def main():
+    print("=" * 60)
+    print("  AI PPT Generator v2 — Formatting + Schema Aware")
+    print("=" * 60)
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise EnvironmentError(
+            "ANTHROPIC_API_KEY not set.\n"
+            "Run: export ANTHROPIC_API_KEY='your-key-here'"
+        )
+
+    # Create folders if missing
+    for folder in [INPUT_OLD_PPT_FOLDER, INPUT_EXCEL_FOLDER,
+                   INPUT_NEW_INFO_FOLDER, OUTPUT_FOLDER]:
+        os.makedirs(folder, exist_ok=True)
+
+    # Step 1 — Read old PPT with full formatting
+    old_prs, old_ppt_info = read_old_ppt_full(INPUT_OLD_PPT_FOLDER)
+
+    # Step 2 — Read Excel + new product info
+    excel_data       = read_excel_data(INPUT_EXCEL_FOLDER)
+    new_product_info = read_new_product_info(INPUT_NEW_INFO_FOLDER)
+
+    # Step 3 — Build data schema (structural vs variable)
+    data_schema = build_data_schema(old_ppt_info, excel_data)
+
+    # Step 4 — Claude generates slide content (schema-aware + formatting-preserved)
+    generated_slides = generate_slides_with_claude(
+        old_ppt_info, data_schema, excel_data, new_product_info
+    )
+
+    # Step 5 — Build new PPT with exact formatting applied
+    output_path = os.path.join(OUTPUT_FOLDER, OUTPUT_FILENAME)
+    build_pptx_formatted(old_prs, old_ppt_info, generated_slides, output_path)
+
+    print("\nDone! Check the 'output/' folder for your new PPT.")
+
+
+if __name__ == "__main__":
+    main()
